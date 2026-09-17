@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { createRoom, roomExists, signalGuestJoined, setPresence, pruneRoomIfEmpty, setSpeaking, onRemoteSpeaking } from '@/lib/signaling';
+import { createRoom, roomExists, signalGuestJoined, setPresence, pruneRoomIfEmpty } from '@/lib/signaling';
 import { useWebRTC } from '@/hooks/useWebRTC';
 import { useAudioDucking } from '@/hooks/useAudioDucking';
 import FaceCam from './FaceCam';
@@ -41,6 +41,18 @@ export default function Room({ roomId, isHost }: RoomProps) {
     pushToTalkEnd,
   } = useAudioDucking();
 
+  // Remote peer's spacebar/button state, delivered P2P via the control
+  // data channel — ducks OUR movie so we can hear THEIR voice better.
+  const handleControlMessage = useCallback(
+    (msg: unknown) => {
+      const m = msg as { type?: string; active?: boolean };
+      if (m?.type !== 'speaking') return;
+      if (m.active) pushToTalkStart();
+      else pushToTalkEnd();
+    },
+    [pushToTalkStart, pushToTalkEnd],
+  );
+
   const {
     localStream,
     localScreenStream,
@@ -54,11 +66,13 @@ export default function Room({ roomId, isHost }: RoomProps) {
     stopScreenShare,
     toggleMic,
     toggleCam,
+    sendControlMessage,
   } = useWebRTC({
     roomId,
     isHost,
     onPeerConnected: useCallback(() => setStep('connected'), []),
     onPeerDisconnected: useCallback(() => setStep('waiting'), []),
+    onControlMessage: handleControlMessage,
   });
 
   // ── presence cleanup — runs when component unmounts or tab closes ──────────
@@ -141,28 +155,20 @@ export default function Room({ roomId, isHost }: RoomProps) {
   );
 
   // ── push-to-talk helpers (shared by button + spacebar) ───────────────────
+  // Sent P2P over the WebRTC control channel — no Firestore round trip.
+  // This only ever tells the OTHER peer to duck THEIR movie audio; there's
+  // nothing to duck locally, since you hear your own voice directly, not
+  // through the app.
 
   const handleDuckStart = useCallback(() => {
     setIsManualDucking(true);
-    // Signal the remote peer to duck their movie audio
-    setSpeaking(roomId, role, true).catch(console.error);
-  }, [roomId, role]);
+    sendControlMessage({ type: 'speaking', active: true });
+  }, [sendControlMessage]);
 
   const handleDuckEnd = useCallback(() => {
     setIsManualDucking(false);
-    setSpeaking(roomId, role, false).catch(console.error);
-  }, [roomId, role]);
-
-  // ── listen for remote spacebar — duck LOCAL movie when they signal ─────────
-
-  useEffect(() => {
-    if (!roomId) return;
-    const unsub = onRemoteSpeaking(roomId, role, (speaking) => {
-      if (speaking) pushToTalkStart();
-      else pushToTalkEnd();
-    });
-    return unsub;
-  }, [roomId, role, pushToTalkStart, pushToTalkEnd]);
+    sendControlMessage({ type: 'speaking', active: false });
+  }, [sendControlMessage]);
 
   // ── spacebar push-to-talk (skip when typing in chat input) ───────────────
 

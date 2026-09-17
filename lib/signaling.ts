@@ -71,7 +71,6 @@ export async function createRoom(roomId: string): Promise<void> {
     hostScreenStreamId: null,
     guestScreenStreamId: null,
     sync: null,
-    speaking: null,
   });
 }
 
@@ -288,30 +287,6 @@ export function onChatMessages(
   });
 }
 
-// ─── Push-to-talk speaking signal ─────────────────────────────────────────
-// When a peer presses spacebar they write their role here so the other person
-// can duck their own movie audio immediately.
-
-export async function setSpeaking(
-  roomId: string,
-  role: 'host' | 'guest',
-  speaking: boolean,
-): Promise<void> {
-  await updateDoc(doc(db, 'rooms', roomId), {
-    speaking: speaking ? role : null,
-  });
-}
-
-export function onRemoteSpeaking(
-  roomId: string,
-  myRole: 'host' | 'guest',
-  cb: (speaking: boolean) => void,
-): Unsubscribe {
-  let last: boolean | null = null;
-  return onSnapshot(doc(db, 'rooms', roomId), (snap) => {
-    const speakingRole = snap.data()?.speaking ?? null;
-    // Only react when the OTHER person is the one signalling
-    const active = speakingRole !== null && speakingRole !== myRole;
-    if (active !== last) { last = active; cb(active); }
-  });
-}
+// Push-to-talk speaking state is no longer signaled through Firestore —
+// it rides the WebRTC control data channel instead (see useWebRTC.ts) for
+// P2P latency instead of a round trip through Firestore's backend.

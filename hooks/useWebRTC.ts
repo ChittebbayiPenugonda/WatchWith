@@ -28,6 +28,9 @@ interface UseWebRTCOptions {
   isHost: boolean;
   onPeerConnected?: () => void;
   onPeerDisconnected?: () => void;
+  // Fired for messages arriving on the P2P control data channel
+  // (e.g. push-to-talk speaking state) — no Firestore round trip.
+  onControlMessage?: (msg: unknown) => void;
 }
 
 export interface WebRTCState {
@@ -46,6 +49,7 @@ export function useWebRTC({
   isHost,
   onPeerConnected,
   onPeerDisconnected,
+  onControlMessage,
 }: UseWebRTCOptions) {
   const pc = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -56,6 +60,7 @@ export function useWebRTC({
   const remoteScreenIdRef = useRef<string | null>(null);
   const lastOfferTs = useRef(0);
   const lastAnswerTs = useRef(0);
+  const dataChannel = useRef<RTCDataChannel | null>(null);
   // Persistent guards — survive effect re-runs caused by re-renders
   const guestJoinedHandled = useRef(false);
 
@@ -63,8 +68,10 @@ export function useWebRTC({
   // even when the parent re-renders with new inline arrow functions.
   const onPeerConnectedRef = useRef(onPeerConnected);
   const onPeerDisconnectedRef = useRef(onPeerDisconnected);
+  const onControlMessageRef = useRef(onControlMessage);
   onPeerConnectedRef.current = onPeerConnected;
   onPeerDisconnectedRef.current = onPeerDisconnected;
+  onControlMessageRef.current = onControlMessage;
 
   const [state, setState] = useState<WebRTCState>({
     localStream: null,
@@ -91,6 +98,25 @@ export function useWebRTC({
     pendingCandidates.current = [];
   }
 
+  // ── P2P control channel ─────────────────────────────────────────────────
+  // Small, latency-sensitive app signals (push-to-talk speaking state, etc.)
+  // ride directly on the RTCPeerConnection instead of round-tripping through
+  // Firestore. Host creates the channel (so it's included in the initial
+  // offer's SDP); the guest picks it up via ondatachannel.
+
+  function wireDataChannel(channel: RTCDataChannel) {
+    dataChannel.current = channel;
+    channel.onopen = () => console.log('[WebRTC] control channel open');
+    channel.onclose = () => console.log('[WebRTC] control channel closed');
+    channel.onmessage = (e) => {
+      try {
+        onControlMessageRef.current?.(JSON.parse(e.data));
+      } catch (err) {
+        console.error('[WebRTC] bad control message:', err);
+      }
+    };
+  }
+
   // ── build peer connection ─────────────────────────────────────────────────
   // Only depends on primitives (roomId, isHost) — stable across renders.
   // Callbacks are accessed via refs so they're always current without
@@ -98,6 +124,15 @@ export function useWebRTC({
 
   const buildPC = useCallback((): RTCPeerConnection => {
     const conn = new RTCPeerConnection(ICE_CONFIG);
+
+    // Only the host opens the channel — it just needs to exist on one side
+    // before the initial offer is created so it's negotiated in that SDP.
+    // The guest receives the same logical channel via ondatachannel below.
+    if (isHost) {
+      wireDataChannel(conn.createDataChannel('control', { ordered: true }));
+    } else {
+      conn.ondatachannel = (e) => wireDataChannel(e.channel);
+    }
 
     conn.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
@@ -236,6 +271,17 @@ export function useWebRTC({
     updateState({ isScreenSharing: false, localScreenStream: null, remoteScreenStream: null });
   }, [roomId, isHost]);
 
+  // ── control channel send ─────────────────────────────────────────────────
+  // No-ops (and drops the message) if the channel isn't open yet — that's
+  // fine for something like push-to-talk since there's nothing to duck on
+  // the other end before the peers are connected anyway.
+
+  const sendControlMessage = useCallback((msg: unknown) => {
+    const channel = dataChannel.current;
+    if (!channel || channel.readyState !== 'open') return;
+    channel.send(JSON.stringify(msg));
+  }, []);
+
   // ── mic / cam toggles ─────────────────────────────────────────────────────
 
   const toggleMic = useCallback(() => {
@@ -370,6 +416,7 @@ export function useWebRTC({
     return () => {
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+      dataChannel.current?.close();
       pc.current?.close();
     };
   }, []);
@@ -382,5 +429,6 @@ export function useWebRTC({
     toggleMic,
     toggleCam,
     createInitialOffer,
+    sendControlMessage,
   };
 }
